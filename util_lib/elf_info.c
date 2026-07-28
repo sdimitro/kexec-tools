@@ -954,20 +954,132 @@ static void dump_dmesg_structured(int fd, void (*handler)(char*, unsigned int))
 		handler(out_buf, len);
 }
 
+#define PRB_MAX_STRUCT_SIZE	(64 * 1024)
+#define PRB_BAD_DATA_EXIT	66
+
+struct prb_region {
+	const char	*name;
+	uint64_t	file_offset;
+	uint64_t	size;
+};
+
 /* convenience struct for passing many values to helper functions */
 struct prb_map {
-	char		*prb;
+	uint64_t	desc_ring_count;
+	struct prb_region desc_region;
+	char		*desc;
 
-	char		*desc_ring;
-	unsigned long	desc_ring_count;
-	char		*descs;
+	struct prb_region info_region;
+	char		*info;
 
-	char		*infos;
-
-	char		*text_data_ring;
-	unsigned long	text_data_ring_size;
-	char		*text_data;
+	uint64_t	text_data_ring_size;
+	struct prb_region text_region;
+	char		*text;
 };
+
+static bool add_overflow_u64(uint64_t a, uint64_t b, uint64_t *sum)
+{
+	if (a > UINT64_MAX - b)
+		return true;
+	*sum = a + b;
+	return false;
+}
+
+static bool mul_overflow_u64(uint64_t a, uint64_t b, uint64_t *product)
+{
+	if (a && b > UINT64_MAX / a)
+		return true;
+	*product = a * b;
+	return false;
+}
+
+static void validate_prb_field(const char *name, uint64_t struct_size,
+			       uint64_t offset, uint64_t field_size)
+{
+	if (offset > struct_size || field_size > struct_size - offset) {
+		fprintf(stderr,
+			"Invalid %s offset or size in VMCOREINFO\n", name);
+		exit(PRB_BAD_DATA_EXIT);
+	}
+}
+
+static void validate_prb_nested_field(const char *name, uint64_t struct_size,
+				      uint64_t outer_offset,
+				      uint64_t inner_offset,
+				      uint64_t field_size)
+{
+	uint64_t offset;
+
+	if (add_overflow_u64(outer_offset, inner_offset, &offset)) {
+		fprintf(stderr,
+			"Invalid %s offset or size in VMCOREINFO\n", name);
+		exit(PRB_BAD_DATA_EXIT);
+	}
+	validate_prb_field(name, struct_size, offset, field_size);
+}
+
+static void read_exact(int fd, void *buf, size_t size, uint64_t offset,
+		       const char *name)
+{
+	size_t done = 0;
+
+	if (offset > INT64_MAX || size > INT64_MAX - offset) {
+		fprintf(stderr, "Invalid file range for %s\n", name);
+		exit(PRB_BAD_DATA_EXIT);
+	}
+
+	while (done < size) {
+		ssize_t ret;
+
+		ret = pread(fd, (char *)buf + done, size - done,
+			    (off_t)(offset + done));
+		if (ret < 0 && errno == EINTR)
+			continue;
+		if (ret < 0) {
+			fprintf(stderr, "Failed to read %s: %s\n",
+				name, strerror(errno));
+			exit(65);
+		}
+		if (!ret) {
+			fprintf(stderr, "Short read while reading %s\n", name);
+			exit(65);
+		}
+		done += ret;
+	}
+}
+
+static void prb_region_init(struct prb_region *region, const char *name,
+			    uint64_t file_offset, uint64_t size)
+{
+	uint64_t end;
+
+	if (!size || file_offset > INT64_MAX ||
+	    add_overflow_u64(file_offset, size, &end) ||
+	    end > INT64_MAX) {
+		fprintf(stderr, "Invalid %s ring range\n", name);
+		exit(PRB_BAD_DATA_EXIT);
+	}
+
+	region->name = name;
+	region->file_offset = file_offset;
+	region->size = size;
+}
+
+static void prb_region_read(int fd, struct prb_region *region,
+			    uint64_t offset, void *buf, size_t size)
+{
+	uint64_t file_offset;
+
+	if (offset > region->size || size > region->size - offset) {
+		fprintf(stderr, "Invalid read outside %s ring\n", region->name);
+		exit(PRB_BAD_DATA_EXIT);
+	}
+	if (add_overflow_u64(region->file_offset, offset, &file_offset)) {
+		fprintf(stderr, "Invalid %s read offset\n", region->name);
+		exit(PRB_BAD_DATA_EXIT);
+	}
+	read_exact(fd, buf, size, file_offset, region->name);
+}
 
 /*
  * desc_state and DESC_* definitions taken from kernel source:
@@ -995,7 +1107,7 @@ enum desc_state {
 
 #define DESC32_SV_BITS		(sizeof(uint32_t) * 8)
 #define DESC32_FLAGS_SHIFT	(DESC32_SV_BITS - 2)
-#define DESC32_FLAGS_MASK	(3UL << DESC32_FLAGS_SHIFT)
+#define DESC32_FLAGS_MASK	(3U << DESC32_FLAGS_SHIFT)
 #define DESC32_STATE(sv)	(3UL & (sv >> DESC32_FLAGS_SHIFT))
 #define DESC32_ID_MASK		(~DESC32_FLAGS_MASK)
 #define DESC32_ID(sv)		((sv) & DESC32_ID_MASK)
@@ -1009,8 +1121,7 @@ enum desc_state {
  */
 
 /* Query the state of a descriptor. */
-static enum desc_state get_desc_state(unsigned long id,
-				      uint64_t state_val)
+static enum desc_state get_desc_state(uint64_t id, uint64_t state_val)
 {
 	if (id != DESC_ID(state_val))
 		return desc_miss;
@@ -1018,8 +1129,7 @@ static enum desc_state get_desc_state(unsigned long id,
 	return DESC_STATE(state_val);
 }
 
-static enum desc_state get_desc32_state(unsigned long id,
-					uint64_t state_val)
+static enum desc_state get_desc32_state(uint64_t id, uint64_t state_val)
 {
 	if (id != DESC32_ID(state_val))
 		return desc_miss;
@@ -1027,7 +1137,7 @@ static enum desc_state get_desc32_state(unsigned long id,
 	return DESC32_STATE(state_val);
 }
 
-static bool record_committed(unsigned long id, uint64_t state_var)
+static bool record_committed(uint64_t id, uint64_t state_var)
 {
 	enum desc_state state;
 
@@ -1061,7 +1171,7 @@ static uint64_t sizeof_ulong(void)
 	return (machine_pointer_bits() >> 3);
 }
 
-static void dump_record(struct prb_map *m, unsigned long id,
+static void dump_record(int fd, struct prb_map *m, uint64_t id,
 			void (*handler)(char*, unsigned int))
 {
 #define OUT_BUF_SIZE	4096
@@ -1074,57 +1184,75 @@ static void dump_record(struct prb_map *m, unsigned long id,
 	uint64_t ts_nsec;
 	uint64_t begin;
 	uint64_t next;
-	char *info;
-	char *text;
-	char *desc;
-	int i;
+	uint64_t desc_offset;
+	uint64_t info_offset;
+	uint64_t slot;
+	size_t i;
 
-	desc = m->descs + ((id % m->desc_ring_count) * prb_desc_sz);
-	info = m->infos + ((id % m->desc_ring_count) * printk_info_sz);
+	slot = id % m->desc_ring_count;
+	if (mul_overflow_u64(slot, prb_desc_sz, &desc_offset) ||
+	    mul_overflow_u64(slot, printk_info_sz, &info_offset)) {
+		fprintf(stderr, "Invalid printk ring record offset\n");
+		exit(PRB_BAD_DATA_EXIT);
+	}
+	prb_region_read(fd, &m->desc_region, desc_offset, m->desc,
+			prb_desc_sz);
 
 	/* skip non-committed record */
-	state_var = get_ulong(desc + prb_desc_state_var_offset +
-					atomic_long_t_counter_offset);
+	state_var = get_ulong(m->desc + prb_desc_state_var_offset +
+						atomic_long_t_counter_offset);
 	if (!record_committed(id, state_var))
 		return;
 
-	begin = get_ulong(desc + prb_desc_text_blk_lpos_offset +
+	prb_region_read(fd, &m->info_region, info_offset, m->info,
+			printk_info_sz);
+
+	begin = get_ulong(m->desc + prb_desc_text_blk_lpos_offset +
 			  prb_data_blk_lpos_begin_offset) %
 		m->text_data_ring_size;
-	next = get_ulong(desc + prb_desc_text_blk_lpos_offset +
+	next = get_ulong(m->desc + prb_desc_text_blk_lpos_offset +
 			 prb_data_blk_lpos_next_offset) %
 	       m->text_data_ring_size;
 
-	ts_nsec = struct_val_u64(info, printk_info_ts_nsec_offset);
+	/* skip data-less text blocks */
+	if (begin == next) {
+		len = 0;
+	} else {
+		len = struct_val_u16(m->info, printk_info_text_len_offset);
+
+		/* handle wrapping data block */
+		if (begin > next)
+			begin = 0;
+
+		/* skip over descriptor ID */
+		if (begin > UINT64_MAX - sizeof_ulong()) {
+			fprintf(stderr, "Invalid printk text block position\n");
+			exit(PRB_BAD_DATA_EXIT);
+		}
+		begin += sizeof_ulong();
+		if (begin > next) {
+			fprintf(stderr, "Invalid printk text block range\n");
+			exit(PRB_BAD_DATA_EXIT);
+		}
+
+		/* handle truncated messages */
+		if (next - begin < len)
+			len = next - begin;
+
+		prb_region_read(fd, &m->text_region, begin, m->text, len);
+	}
+
+	ts_nsec = struct_val_u64(m->info, printk_info_ts_nsec_offset);
 	imaxdiv_sec = imaxdiv(ts_nsec, 1000000000);
 	imaxdiv_usec = imaxdiv(imaxdiv_sec.rem, 1000);
 
 	offset += sprintf(out_buf + offset, "[%5llu.%06llu] ",
-		(long long unsigned int)imaxdiv_sec.quot,
-		(long long unsigned int)imaxdiv_usec.quot);
-
-	/* skip data-less text blocks */
-	if (begin == next)
-		goto out;
-
-	len = struct_val_u16(info, printk_info_text_len_offset);
-
-	/* handle wrapping data block */
-	if (begin > next)
-		begin = 0;
-
-	/* skip over descriptor ID */
-	begin += sizeof_ulong();
-
-	/* handle truncated messages */
-	if (next - begin < len)
-		len = next - begin;
-
-	text = m->text_data + begin;
+		(unsigned long long)imaxdiv_sec.quot,
+		(unsigned long long)imaxdiv_usec.quot);
 
 	/* escape non-printable characters */
 	for (i = 0; i < len; i++) {
-		unsigned char c = text[i];
+		unsigned char c = m->text[i];
 
 		if (!isprint(c) && !isspace(c))
 			offset += sprintf(out_buf + offset, "\\x%02x", c);
@@ -1137,7 +1265,6 @@ static void dump_record(struct prb_map *m, unsigned long id,
 			offset = 0;
 		}
 	}
-out:
 	out_buf[offset++] = '\n';
 
 	if (offset && handler)
@@ -1150,102 +1277,179 @@ out:
 static void dump_dmesg_lockless(int fd, void (*handler)(char*, unsigned int))
 {
 	struct prb_map m;
+	char *prb;
+	char *desc_ring;
+	char *text_data_ring;
+	uint64_t desc_region_size;
+	uint64_t info_region_size;
+	uint64_t id_mask;
+	uint64_t record_count;
 	uint64_t head_id;
 	uint64_t tail_id;
 	uint64_t kaddr;
 	uint64_t id;
-	int ret;
+	uint64_t count_bits;
+	uint64_t size_bits;
+	uint64_t word_size;
 
 	/* setup printk_ringbuffer */
+	memset(&m, 0, sizeof(m));
 	kaddr = read_file_pointer(fd, vaddr_to_offset(prb_vaddr));
-	m.prb = calloc(1, printk_ringbuffer_sz);
-	if (!m.prb) {
+	if (!kaddr || !printk_ringbuffer_sz ||
+	    printk_ringbuffer_sz > PRB_MAX_STRUCT_SIZE ||
+	    !prb_desc_sz || prb_desc_sz > PRB_MAX_STRUCT_SIZE ||
+	    !printk_info_sz || printk_info_sz > PRB_MAX_STRUCT_SIZE) {
+		fprintf(stderr, "Invalid printk ring metadata\n");
+		exit(PRB_BAD_DATA_EXIT);
+	}
+	prb = calloc(1, printk_ringbuffer_sz);
+	if (!prb) {
 		fprintf(stderr, "Failed to malloc %zu bytes for prb: %s\n",
 			printk_ringbuffer_sz, strerror(errno));
 		exit(64);
 	}
-	ret = pread(fd, m.prb, printk_ringbuffer_sz, vaddr_to_offset(kaddr));
-	if (ret != printk_ringbuffer_sz) {
-		fprintf(stderr, "Failed to read prb of size %zu bytes: %s\n",
-			printk_ringbuffer_sz, strerror(errno));
-		exit(65);
-	}
+	read_exact(fd, prb, printk_ringbuffer_sz, vaddr_to_offset(kaddr),
+		   "printk ringbuffer");
+
+	word_size = sizeof_ulong();
+	validate_prb_field("printk_ringbuffer.desc_ring",
+			   printk_ringbuffer_sz,
+			   printk_ringbuffer_desc_ring_offset, 1);
+	validate_prb_field("prb_desc_ring.count_bits",
+			   printk_ringbuffer_sz -
+			   printk_ringbuffer_desc_ring_offset,
+			   prb_desc_ring_count_bits_offset, sizeof(uint32_t));
+	validate_prb_field("prb_desc_ring.descs",
+			   printk_ringbuffer_sz -
+			   printk_ringbuffer_desc_ring_offset,
+			   prb_desc_ring_descs_offset, word_size);
+	validate_prb_field("prb_desc_ring.infos",
+			   printk_ringbuffer_sz -
+			   printk_ringbuffer_desc_ring_offset,
+			   prb_desc_ring_infos_offset, word_size);
+	validate_prb_nested_field("prb_desc_ring.head_id",
+				  printk_ringbuffer_sz -
+				  printk_ringbuffer_desc_ring_offset,
+				  prb_desc_ring_head_id_offset,
+				  atomic_long_t_counter_offset, word_size);
+	validate_prb_nested_field("prb_desc_ring.tail_id",
+				  printk_ringbuffer_sz -
+				  printk_ringbuffer_desc_ring_offset,
+				  prb_desc_ring_tail_id_offset,
+				  atomic_long_t_counter_offset, word_size);
+	validate_prb_field("printk_ringbuffer.text_data_ring",
+			   printk_ringbuffer_sz,
+			   printk_ringbuffer_text_data_ring_offset, 1);
+	validate_prb_field("prb_data_ring.size_bits",
+			   printk_ringbuffer_sz -
+			   printk_ringbuffer_text_data_ring_offset,
+			   prb_data_ring_size_bits_offset, sizeof(uint32_t));
+	validate_prb_field("prb_data_ring.data",
+			   printk_ringbuffer_sz -
+			   printk_ringbuffer_text_data_ring_offset,
+			   prb_data_ring_data_offset, word_size);
+	validate_prb_nested_field("prb_desc.state_var", prb_desc_sz,
+				  prb_desc_state_var_offset,
+				  atomic_long_t_counter_offset, word_size);
+	validate_prb_nested_field("prb_desc.text_blk_lpos.begin", prb_desc_sz,
+				  prb_desc_text_blk_lpos_offset,
+				  prb_data_blk_lpos_begin_offset, word_size);
+	validate_prb_nested_field("prb_desc.text_blk_lpos.next", prb_desc_sz,
+				  prb_desc_text_blk_lpos_offset,
+				  prb_data_blk_lpos_next_offset, word_size);
+	validate_prb_field("printk_info.ts_nsec", printk_info_sz,
+			   printk_info_ts_nsec_offset, sizeof(uint64_t));
+	validate_prb_field("printk_info.text_len", printk_info_sz,
+			   printk_info_text_len_offset, sizeof(uint16_t));
 
 	/* setup descriptor ring */
-	m.desc_ring = m.prb + printk_ringbuffer_desc_ring_offset;
-	m.desc_ring_count = 1 << struct_val_u32(m.desc_ring,
-					prb_desc_ring_count_bits_offset);
-	kaddr = get_ulong(m.desc_ring + prb_desc_ring_descs_offset);
-	m.descs = calloc(1, prb_desc_sz * m.desc_ring_count);
-	if (!m.descs) {
-		fprintf(stderr, "Failed to malloc %lu bytes for descs: %s\n",
-			prb_desc_sz * m.desc_ring_count, strerror(errno));
-		exit(64);
+	desc_ring = prb + printk_ringbuffer_desc_ring_offset;
+	count_bits = struct_val_u32(desc_ring,
+				    prb_desc_ring_count_bits_offset);
+	if (count_bits >= machine_pointer_bits() - 2) {
+		fprintf(stderr, "Invalid printk descriptor count bits: %llu\n",
+			(unsigned long long)count_bits);
+		exit(PRB_BAD_DATA_EXIT);
 	}
-	ret = pread(fd, m.descs, prb_desc_sz * m.desc_ring_count,
-		    vaddr_to_offset(kaddr));
-	if (ret != prb_desc_sz * m.desc_ring_count) {
-		fprintf(stderr,
-			"Failed to read descs of size %lu bytes: %s\n",
-			prb_desc_sz * m.desc_ring_count, strerror(errno));
-		exit(65);
+	m.desc_ring_count = 1ULL << count_bits;
+	if (mul_overflow_u64(prb_desc_sz, m.desc_ring_count,
+			     &desc_region_size) ||
+	    mul_overflow_u64(printk_info_sz, m.desc_ring_count,
+			     &info_region_size)) {
+		fprintf(stderr, "Invalid printk descriptor ring size\n");
+		exit(PRB_BAD_DATA_EXIT);
 	}
+	kaddr = get_ulong(desc_ring + prb_desc_ring_descs_offset);
+	if (!kaddr) {
+		fprintf(stderr, "Invalid printk descriptor ring address\n");
+		exit(PRB_BAD_DATA_EXIT);
+	}
+	prb_region_init(&m.desc_region, "printk descriptors",
+			vaddr_to_offset(kaddr), desc_region_size);
 
 	/* setup info ring */
-	kaddr = get_ulong(m.prb + prb_desc_ring_infos_offset);
-	m.infos = calloc(1, printk_info_sz * m.desc_ring_count);
-	if (!m.infos) {
-		fprintf(stderr, "Failed to malloc %lu bytes for infos: %s\n",
-			printk_info_sz * m.desc_ring_count, strerror(errno));
-		exit(64);
+	kaddr = get_ulong(desc_ring + prb_desc_ring_infos_offset);
+	if (!kaddr) {
+		fprintf(stderr, "Invalid printk info ring address\n");
+		exit(PRB_BAD_DATA_EXIT);
 	}
-	ret = pread(fd, m.infos, printk_info_sz * m.desc_ring_count,
-		    vaddr_to_offset(kaddr));
-	if (ret != printk_info_sz * m.desc_ring_count) {
-		fprintf(stderr,
-			"Failed to read infos of size %lu bytes: %s\n",
-			printk_info_sz * m.desc_ring_count, strerror(errno));
-		exit(65);
-	}
+	prb_region_init(&m.info_region, "printk infos",
+			vaddr_to_offset(kaddr), info_region_size);
 
 	/* setup text data ring */
-	m.text_data_ring = m.prb + printk_ringbuffer_text_data_ring_offset;
-	m.text_data_ring_size = 1 << struct_val_u32(m.text_data_ring,
-					prb_data_ring_size_bits_offset);
-	kaddr = get_ulong(m.text_data_ring + prb_data_ring_data_offset);
-	m.text_data = calloc(1, m.text_data_ring_size);
-	if (!m.text_data) {
-		fprintf(stderr,
-			"Failed to malloc %lu bytes for text_data: %s\n",
-			m.text_data_ring_size, strerror(errno));
-		exit(64);
+	text_data_ring = prb + printk_ringbuffer_text_data_ring_offset;
+	size_bits = struct_val_u32(text_data_ring,
+				   prb_data_ring_size_bits_offset);
+	if (size_bits >= machine_pointer_bits()) {
+		fprintf(stderr, "Invalid printk text data size bits: %llu\n",
+			(unsigned long long)size_bits);
+		exit(PRB_BAD_DATA_EXIT);
 	}
-	ret = pread(fd, m.text_data, m.text_data_ring_size,
-		    vaddr_to_offset(kaddr));
-	if (ret != m.text_data_ring_size) {
-		fprintf(stderr,
-			"Failed to read text_data of size %lu bytes: %s\n",
-			m.text_data_ring_size, strerror(errno));
-		exit(65);
+	m.text_data_ring_size = 1ULL << size_bits;
+	kaddr = get_ulong(text_data_ring + prb_data_ring_data_offset);
+	if (!kaddr) {
+		fprintf(stderr, "Invalid printk text data ring address\n");
+		exit(PRB_BAD_DATA_EXIT);
+	}
+	prb_region_init(&m.text_region, "printk text data",
+			vaddr_to_offset(kaddr), m.text_data_ring_size);
+
+	m.desc = malloc(prb_desc_sz);
+	m.info = malloc(printk_info_sz);
+	m.text = malloc(UINT16_MAX);
+	if (!m.desc || !m.info || !m.text) {
+		fprintf(stderr, "Failed to allocate printk record buffers: %s\n",
+			strerror(errno));
+		exit(64);
 	}
 
 	/* ready to go */
 
-	tail_id = get_ulong(m.desc_ring + prb_desc_ring_tail_id_offset +
+	tail_id = get_ulong(desc_ring + prb_desc_ring_tail_id_offset +
 						atomic_long_t_counter_offset);
-	head_id = get_ulong(m.desc_ring + prb_desc_ring_head_id_offset +
+	head_id = get_ulong(desc_ring + prb_desc_ring_head_id_offset +
 						atomic_long_t_counter_offset);
+	free(prb);
+	id_mask = machine_pointer_bits() == 32 ? DESC32_ID_MASK : DESC_ID_MASK;
+	if ((tail_id & ~id_mask) || (head_id & ~id_mask)) {
+		fprintf(stderr, "Invalid printk descriptor head or tail ID\n");
+		exit(PRB_BAD_DATA_EXIT);
+	}
 
-	for (id = tail_id; id != head_id; id = id_inc(id))
-		dump_record(&m, id, handler);
+	for (id = tail_id, record_count = 0; ; id = id_inc(id)) {
+		if (record_count++ >= m.desc_ring_count) {
+			fprintf(stderr,
+				"Printk descriptor head/tail span exceeds ring size\n");
+			exit(PRB_BAD_DATA_EXIT);
+		}
+		dump_record(fd, &m, id, handler);
+		if (id == head_id)
+			break;
+	}
 
-	/* dump head record */
-	dump_record(&m, id, handler);
-
-	free(m.text_data);
-	free(m.infos);
-	free(m.descs);
-	free(m.prb);
+	free(m.text);
+	free(m.info);
+	free(m.desc);
 }
 
 void dump_dmesg(int fd, void (*handler)(char*, unsigned int))
